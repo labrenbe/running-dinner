@@ -7,92 +7,80 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/jmoiron/sqlx"
-	_ "github.com/mattn/go-sqlite3"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
-var dinnerSchema = `CREATE TABLE IF NOT EXISTS dinner (
-	id   VARCHAR(36) PRIMARY KEY,
-  name VARCHAR(80),
-	date DATETIME,
-	team_size   INTEGER,
-	teams_per_course INTEGER
-);`
-
-var courseSchema = `CREATE TABLE IF NOT EXISTS course (
-	id   VARCHAR(36) PRIMARY KEY,
-  name VARCHAR(80),
-	position INTEGER,
-	team_size   INTEGER
-);`
-
-var teamSchema = `CREATE TABLE IF NOT EXISTS team (
-	id   VARCHAR(36) PRIMARY KEY,
-	dinner_id VARCHAR(36)
-);`
-
-var teamMemberSchema = `CREATE TABLE IF NOT EXISTS team (
-	id   VARCHAR(36) PRIMARY KEY,
-	name VARCHAR(50),
-	team_id VARCHAR(36)
-);`
-
 type Dinner struct {
-	Id             string    `db:"id" json:"id"`
-	Name           string    `db:"name" json:"name"`
-	Date           time.Time `db:"date" json:"date"`
-	TeamSize       int       `db:"team_size" json:"team_size"`
-	TeamsPerCourse int       `db:"teams_per_course" json:"teams_per_course"`
+	DinnerId       string    `json:"dinnerId" gorm:"primaryKey"`
+	SignupId       string    `json:"signupId"`
+	Name           string    `json:"name"`
+	Description    string    `json:"description"`
+	Date           time.Time `json:"date"`
+	TeamSize       int       `json:"teamSize"`
+	TeamsPerCourse int       `json:"teamsPerCourse"`
+	Courses        []Course  `json:"courses"`
+	Teams          []Team    `json:"teams"`
 }
 
 type Course struct {
-	Id       string `db:"id" json:"id"`
-	Name     string `db:"name" json:"name"`
-	Position int    `db:"position" json:"position"`
+	CourseId      string        `json:"courseId" uri:"courseId" gorm:"primaryKey"`
+	DinnerId      string        `json:"-" uri:"dinnerId"`
+	Name          string        `json:"name"`
+	Time          time.Time     `json:"time"`
+	Duration      int           `json:"duration"`
+	CourseMatches []CourseMatch `json:"courseMatches"`
 }
 
 type Team struct {
-	Id       string `db:"id" json:"id"`
-	DinnerId string `db:"dinner_id" json:"dinner_id"`
+	TeamId        string        `json:"teamId" uri:"teamId" gorm:"primaryKey"`
+	SignupId      string        `json:"signupId"`
+	DinnerId      string        `json:"-"`
+	TeamMembers   []string      `json:"teamMembers" gorm:"serializer:json"`
+	CourseMatches []CourseMatch `json:"courseMatches" gorm:"many2many:team_course_matches"`
+	Address       string        `json:"address"`
 }
 
-type TeamMember struct {
-	Id     string `db:"id" json:"id"`
-	Name   string `db:"name" json:"name"`
-	TeamId string `db:"team_id" json:"team_id"`
+type CourseMatch struct {
+	CourseMatchId string `json:"-" gorm:"primaryKey"`
+	CourseId      string `json:"course"`
+	Teams         []Team `json:"teams" gorm:"many2many:team_course_matches"`
+	Host          Team   `json:"host" gorm:"foreignKey:TeamId"`
 }
+
+var db *gorm.DB
 
 func main() {
-	initDb()
-	g := gin.Default()
-	g.POST("/dinner", createDinner)
-	g.GET("/dinner/:uuid", getDinner)
-
-	g.Run()
-	log.Println("Started Gin server")
-}
-
-func initDb() {
-	db := getDb()
-	defer db.Close()
-
-	db.MustExec(dinnerSchema)
-	db.MustExec(courseSchema)
-	db.MustExec(teamSchema)
-	db.MustExec(teamMemberSchema)
-}
-
-func getDb() *sqlx.DB {
-	db, err := sqlx.Connect("sqlite3", "dinner.db")
+	var err error
+	db, err = gorm.Open(sqlite.Open("dinner.db"), &gorm.Config{})
 	if err != nil {
-		log.Fatalln(err)
+		panic("failed to connect database")
 	}
-	return db
+
+	db.AutoMigrate(&Dinner{})
+	db.AutoMigrate(&Course{})
+	db.AutoMigrate(&Team{})
+	db.AutoMigrate(&CourseMatch{})
+
+	r := gin.Default()
+
+	r.POST("/dinners", createDinner)
+	r.GET("/dinners/:dinnerId", getDinner)
+	r.PUT("/dinners", updateDinner)
+	r.DELETE("/dinners/:dinnerId", deleteDinner)
+
+	r.POST("/teams", createTeam)
+	r.GET("/teams/:teamId", getTeam)
+	r.PUT("/teams", updateTeam)
+	r.DELETE("/teams/:teamId", deleteTeam)
+
+	r.Run()
 }
 
 func createDinner(c *gin.Context) {
 	var dinner Dinner
-	dinner.Id = uuid.New().String()
+	dinner.DinnerId = uuid.New().String()
+	dinner.SignupId = uuid.New().String()
 	dinner.Date = time.Now()
 
 	if err := c.BindJSON(&dinner); err != nil {
@@ -101,35 +89,123 @@ func createDinner(c *gin.Context) {
 		return
 	}
 
-	db := getDb()
-	defer db.Close()
-
-	log.Println(dinner)
-	_, err := db.NamedExec("INSERT INTO dinner (id, name, date, team_size, teams_per_course) VALUES (:id, :name, :date, :team_size, :teams_per_course)", dinner)
-	if err != nil {
+	if err := db.Create(dinner).Error; err != nil {
 		log.Println(err)
 		c.Status(http.StatusInternalServerError)
 		return
 	}
 
-	c.JSON(http.StatusOK, dinner.Id)
+	c.JSON(http.StatusCreated, dinner)
 }
 
 func getDinner(c *gin.Context) {
-	uuid := c.Param("uuid")
-	db := getDb()
-	defer db.Close()
+	dinnerId := c.Param("dinnerId")
 
-	dinners := []Dinner{}
-	err := db.Select(&dinners, `SELECT * FROM dinner WHERE id = $1`, uuid)
-	if err != nil {
+	var dinner Dinner
+	if err := db.Preload("Teams").Preload("Courses").First(&dinner, &Dinner{DinnerId: dinnerId}).Error; err != nil {
+		c.Status(http.StatusNotFound)
+		return
+	}
+
+	c.JSON(http.StatusOK, dinner)
+}
+
+func updateDinner(c *gin.Context) {
+	var dinner Dinner
+
+	if err := c.BindJSON(&dinner); err != nil {
+		log.Println(err)
+		c.Status(http.StatusBadRequest)
+		return
+	}
+
+	if err := db.Updates(&dinner).Error; err != nil {
+		log.Println(err)
+		c.Status(http.StatusNotFound)
+		return
+	}
+
+	c.JSON(http.StatusOK, dinner)
+}
+
+func deleteDinner(c *gin.Context) {
+	dinnerId := c.Param("dinnerId")
+
+	if err := db.Delete(&Dinner{}, &Dinner{DinnerId: dinnerId}).Error; err != nil {
+		log.Println(err)
+		c.Status(http.StatusNotFound)
+		return
+	}
+
+	c.Status(http.StatusOK)
+}
+
+func createTeam(c *gin.Context) {
+	var team Team
+	team.TeamId = uuid.New().String()
+	team.CourseMatches = []CourseMatch{}
+
+	if err := c.BindJSON(&team); err != nil {
+		log.Println(err)
+		c.Status(http.StatusBadRequest)
+		return
+	}
+
+	var dinner Dinner
+	if err := db.Preload("Teams").First(&dinner, "signup_id = ?", team.SignupId).Error; err != nil {
+		c.Status(http.StatusInternalServerError)
+		return
+	}
+
+	dinner.Teams = append(dinner.Teams, team)
+
+	if err := db.Save(&dinner).Error; err != nil {
 		log.Println(err)
 		c.Status(http.StatusInternalServerError)
 		return
 	}
-	if len(dinners) == 0 {
+
+	c.JSON(http.StatusCreated, team)
+}
+
+func getTeam(c *gin.Context) {
+	teamId := c.Param("teamId")
+
+	var team Team
+	if err := db.Preload("CourseMatches").Preload("Courses").Preload("Teams").First(&team, &Team{TeamId: teamId}).Error; err != nil {
 		c.Status(http.StatusNotFound)
 		return
 	}
-	c.JSON(http.StatusOK, dinners[0])
+
+	c.JSON(http.StatusOK, team)
+}
+
+func updateTeam(c *gin.Context) {
+	var team Team
+
+	if err := c.BindJSON(&team); err != nil {
+		log.Println(err)
+		c.Status(http.StatusBadRequest)
+		return
+	}
+
+	if err := db.Model(&team).Omit("SignupId", "CourseMatches").Updates(&team).Error; err != nil {
+		log.Println(err)
+		c.Status(http.StatusNotFound)
+		return
+	}
+
+	c.JSON(http.StatusOK, team)
+}
+
+func deleteTeam(c *gin.Context) {
+	teamId := c.Param("teamId")
+
+	if err := db.Delete(&Team{}, &Team{TeamId: teamId}).Error; err != nil {
+		log.Println(err)
+		c.Status(http.StatusNotFound)
+		return
+	}
+
+	c.Status(http.StatusOK)
 }
